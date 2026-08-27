@@ -23,12 +23,13 @@ type Folder struct {
 	LibraryID string `json:"libraryId,omitempty"`
 }
 
-// LibraryItemsResponse is the paginated response from ABS API
+// LibraryItemsResponse is the paginated response from ABS API.
+// Audiobookshelf uses a zero-based `page` query/response field (not `offset`).
 type LibraryItemsResponse struct {
 	Results []LibraryItem `json:"results"`
 	Total   int           `json:"total"`
 	Limit   int           `json:"limit"`
-	Offset  int           `json:"offset"`
+	Page    int           `json:"page"`
 }
 
 // LibraryItem represents an audiobook/podcast in ABS
