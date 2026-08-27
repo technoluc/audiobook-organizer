@@ -70,12 +70,8 @@ function restoreMappings(mappings: PersistedWebState['absPathMappings']) {
   const absInputs = [...document.querySelectorAll<HTMLInputElement>('input[aria-label="ABS path prefix"]')]
   const localInputs = [...document.querySelectorAll<HTMLInputElement>('input[aria-label="Local path prefix"]')]
 
-  // Vue renders a newly added mapping asynchronously. The old implementation
-  // used a while loop that immediately queried the DOM again after click().
-  // Because the DOM had not updated yet, the input count never changed and the
-  // browser could enter an infinite loop during page restore. Add at most one
-  // row per render cycle; the MutationObserver below will continue restoration
-  // after Vue has rendered the new row.
+  // Vue renders a newly added mapping asynchronously. Add at most one row per
+  // render cycle; the MutationObserver below will continue after Vue updates.
   if (addButton && absInputs.length < mappings.length) {
     addButton.click()
     return
@@ -126,17 +122,23 @@ export function installWebStatePersistence() {
   let restoring = false
   let saveTimer: number | undefined
 
+  const restoreABSControls = () => {
+    // The ABS panel is conditionally rendered only after the metadata source has
+    // switched to Audiobookshelf. Restore these fields whenever that panel appears.
+    setInputValue(inputByLabel('ABS server URL'), persisted.absUrl)
+    setInputValue(inputByLabel('ABS API token'), persisted.absToken)
+    restoreMappings(persisted.absPathMappings)
+    setSelectValue(selectByLabel('ABS library'), persisted.absLibrary)
+  }
+
   const restore = () => {
     restoring = true
     try {
       setInputValue(inputByLabel('Source folder'), persisted.sourceFolder)
       setInputValue(inputByLabel('Output folder'), persisted.outputFolder)
-      setInputValue(inputByLabel('ABS server URL'), persisted.absUrl)
-      setInputValue(inputByLabel('ABS API token'), persisted.absToken)
       setSelectValue(selectByLabel('Layout'), persisted.layout)
       restoreMetadataSource(persisted.metadataSource)
-      restoreMappings(persisted.absPathMappings)
-      setSelectValue(selectByLabel('ABS library'), persisted.absLibrary)
+      restoreABSControls()
     } finally {
       restoring = false
     }
@@ -146,8 +148,6 @@ export function installWebStatePersistence() {
     if (restoring) return
     if (saveTimer !== undefined) window.clearTimeout(saveTimer)
     saveTimer = window.setTimeout(() => {
-      // Merge with the previous state so controls that are temporarily not rendered
-      // cannot wipe persisted ABS values during a workflow switch or async reload.
       persisted = { ...persisted, ...collectState() }
       writeState(persisted)
     }, 100)
@@ -157,16 +157,21 @@ export function installWebStatePersistence() {
   document.addEventListener('change', save, true)
   document.addEventListener('click', save, true)
 
-  // Vue and backend bootstrap can overwrite fields after the first render.
-  // Re-apply persisted values during startup, but do not continuously fight
-  // deliberate user edits after the app has settled.
+  // Persist immediately when navigating/reloading as an extra guard around the
+  // short debounce above.
+  window.addEventListener('beforeunload', () => {
+    persisted = { ...persisted, ...collectState() }
+    writeState(persisted)
+  })
+
+  // Vue/bootstrap can overwrite controls during startup.
   window.setTimeout(restore, 0)
   window.setTimeout(restore, 250)
   window.setTimeout(restore, 1000)
   window.setTimeout(restore, 2500)
 
-  // ABS library controls appear asynchronously after Test Connection. Restore
-  // only the late-rendered library selection and mappings when that happens.
+  // ABS controls are conditionally/asynchronously rendered. Restore URL, token,
+  // library and mappings whenever that subtree appears, but debounce DOM churn.
   let observerScheduled = false
   const observer = new MutationObserver(() => {
     if (observerScheduled) return
@@ -174,12 +179,11 @@ export function installWebStatePersistence() {
 
     window.requestAnimationFrame(() => {
       observerScheduled = false
-      const library = selectByLabel('ABS library')
-      if (library && persisted.absLibrary && library.value !== persisted.absLibrary) {
-        setSelectValue(library, persisted.absLibrary)
-      }
-      if (persisted.absPathMappings?.length) {
-        restoreMappings(persisted.absPathMappings)
+      restoring = true
+      try {
+        restoreABSControls()
+      } finally {
+        restoring = false
       }
     })
   })
