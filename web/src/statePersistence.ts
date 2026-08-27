@@ -3,6 +3,7 @@ type PersistedWebState = {
   outputFolder?: string
   metadataSource?: string
   absUrl?: string
+  absToken?: string
   absLibrary?: string
   absPathMappings?: Array<{ absPrefix: string; localPrefix: string }>
   layout?: string
@@ -93,6 +94,7 @@ function collectState(): PersistedWebState {
     outputFolder: inputByLabel('Output folder')?.value,
     metadataSource: checkedMetadataButton ? buttonText(checkedMetadataButton) : undefined,
     absUrl: inputByLabel('ABS server URL')?.value,
+    absToken: inputByLabel('ABS API token')?.value,
     absLibrary: selectByLabel('ABS library')?.value,
     absPathMappings: absInputs.map((input, index) => ({
       absPrefix: input.value,
@@ -115,6 +117,7 @@ export function installWebStatePersistence() {
       setInputValue(inputByLabel('Source folder'), persisted.sourceFolder)
       setInputValue(inputByLabel('Output folder'), persisted.outputFolder)
       setInputValue(inputByLabel('ABS server URL'), persisted.absUrl)
+      setInputValue(inputByLabel('ABS API token'), persisted.absToken)
       setSelectValue(selectByLabel('Layout'), persisted.layout)
       restoreMetadataSource(persisted.metadataSource)
       restoreMappings(persisted.absPathMappings)
