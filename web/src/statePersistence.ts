@@ -24,7 +24,7 @@ function writeState(state: PersistedWebState) {
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
   } catch {
-    // Persistence is a convenience only; never break the UI when storage is unavailable.
+    // Persistence must never break the UI if browser storage is unavailable.
   }
 }
 
@@ -83,31 +83,41 @@ function restoreMappings(mappings: PersistedWebState['absPathMappings']) {
 }
 
 function collectState(): PersistedWebState {
+  const state: PersistedWebState = {}
+
+  const sourceFolder = inputByLabel('Source folder')
+  const outputFolder = inputByLabel('Output folder')
+  const absUrl = inputByLabel('ABS server URL')
+  const absToken = inputByLabel('ABS API token')
+  const absLibrary = selectByLabel('ABS library')
+  const layout = selectByLabel('Layout')
   const checkedMetadataButton = document.querySelector<HTMLButtonElement>(
     '.metadata-source-control button[role="radio"][aria-checked="true"]',
   )
   const absInputs = [...document.querySelectorAll<HTMLInputElement>('input[aria-label="ABS path prefix"]')]
   const localInputs = [...document.querySelectorAll<HTMLInputElement>('input[aria-label="Local path prefix"]')]
 
-  return {
-    sourceFolder: inputByLabel('Source folder')?.value,
-    outputFolder: inputByLabel('Output folder')?.value,
-    metadataSource: checkedMetadataButton ? buttonText(checkedMetadataButton) : undefined,
-    absUrl: inputByLabel('ABS server URL')?.value,
-    absToken: inputByLabel('ABS API token')?.value,
-    absLibrary: selectByLabel('ABS library')?.value,
-    absPathMappings: absInputs.map((input, index) => ({
+  if (sourceFolder) state.sourceFolder = sourceFolder.value
+  if (outputFolder) state.outputFolder = outputFolder.value
+  if (checkedMetadataButton) state.metadataSource = buttonText(checkedMetadataButton)
+  if (absUrl) state.absUrl = absUrl.value
+  if (absToken) state.absToken = absToken.value
+  if (absLibrary) state.absLibrary = absLibrary.value
+  if (layout) state.layout = layout.value
+  if (absInputs.length > 0) {
+    state.absPathMappings = absInputs.map((input, index) => ({
       absPrefix: input.value,
       localPrefix: localInputs[index]?.value ?? '',
-    })),
-    layout: selectByLabel('Layout')?.value,
+    }))
   }
+
+  return state
 }
 
 export function installWebStatePersistence() {
   if (typeof window === 'undefined') return
 
-  const persisted = readState()
+  let persisted = readState()
   let restoring = false
   let saveTimer: number | undefined
 
@@ -130,21 +140,36 @@ export function installWebStatePersistence() {
   const save = () => {
     if (restoring) return
     if (saveTimer !== undefined) window.clearTimeout(saveTimer)
-    saveTimer = window.setTimeout(() => writeState(collectState()), 100)
+    saveTimer = window.setTimeout(() => {
+      // Merge with the previous state so controls that are temporarily not rendered
+      // cannot wipe persisted ABS values during a workflow switch or async reload.
+      persisted = { ...persisted, ...collectState() }
+      writeState(persisted)
+    }, 100)
   }
 
   document.addEventListener('input', save, true)
   document.addEventListener('change', save, true)
   document.addEventListener('click', save, true)
 
-  const observer = new MutationObserver(() => {
-    // Some controls (ABS libraries/mappings) appear only after async API calls.
-    // Re-applying persisted values is idempotent and lets those late controls restore too.
-    window.setTimeout(restore, 0)
-  })
-  observer.observe(document.body, { childList: true, subtree: true })
-
+  // Vue and backend bootstrap can overwrite fields after the first render.
+  // Re-apply persisted values during startup, but do not continuously fight
+  // deliberate user edits after the app has settled.
   window.setTimeout(restore, 0)
   window.setTimeout(restore, 250)
   window.setTimeout(restore, 1000)
+  window.setTimeout(restore, 2500)
+
+  // ABS library controls appear asynchronously after Test Connection. Restore
+  // only the late-rendered library selection and mappings when that happens.
+  const observer = new MutationObserver(() => {
+    const library = selectByLabel('ABS library')
+    if (library && persisted.absLibrary && library.value !== persisted.absLibrary) {
+      setSelectValue(library, persisted.absLibrary)
+    }
+    if (persisted.absPathMappings?.length) {
+      restoreMappings(persisted.absPathMappings)
+    }
+  })
+  observer.observe(document.body, { childList: true, subtree: true })
 }
