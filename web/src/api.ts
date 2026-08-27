@@ -218,6 +218,7 @@ export type OptionsResponse = {
 }
 
 const token = new URLSearchParams(window.location.search).get('token') ?? ''
+const inFlightPreviewPosts = new Map<string, Promise<unknown>>()
 
 export const hasWebSessionToken = token !== ''
 
@@ -229,15 +230,39 @@ export async function apiGet<T>(path: string): Promise<T> {
 }
 
 export async function apiPost<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(path, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { 'X-Audiobook-Organizer-Token': token } : {}),
-    },
-    body: JSON.stringify(body),
-  })
-  return decode<T>(response)
+  const serializedBody = JSON.stringify(body)
+  const dedupePreview = path === '/api/organize/preview' || path === '/api/rename/preview'
+  const requestKey = `${path}\u0000${serializedBody}`
+
+  if (dedupePreview) {
+    const existing = inFlightPreviewPosts.get(requestKey)
+    if (existing) {
+      return existing as Promise<T>
+    }
+  }
+
+  const request = (async () => {
+    const response = await fetch(path, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { 'X-Audiobook-Organizer-Token': token } : {}),
+      },
+      body: serializedBody,
+    })
+    return decode<T>(response)
+  })()
+
+  if (dedupePreview) {
+    inFlightPreviewPosts.set(requestKey, request)
+    request.finally(() => {
+      if (inFlightPreviewPosts.get(requestKey) === request) {
+        inFlightPreviewPosts.delete(requestKey)
+      }
+    })
+  }
+
+  return request
 }
 
 async function decode<T>(response: Response): Promise<T> {
