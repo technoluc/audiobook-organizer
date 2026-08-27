@@ -42,7 +42,7 @@ func (s *Service) PreviewOrganize(
 	default:
 	}
 
-	org, err := s.executeOrganize(req, true)
+	org, err := s.executeOrganize(ctx, req, true)
 	if err != nil {
 		return nil, err
 	}
@@ -60,14 +60,18 @@ func (s *Service) RunOrganize(
 	default:
 	}
 
-	org, err := s.executeOrganize(req, false)
+	org, err := s.executeOrganize(ctx, req, false)
 	if err != nil {
 		return nil, err
 	}
 	return &OrganizeRunResponse{Summary: org.GetSummary(), LogPath: org.GetLogPath()}, nil
 }
 
-func (s *Service) executeOrganize(req OrganizeRequest, dryRun bool) (*organizer.Organizer, error) {
+func (s *Service) executeOrganize(
+	ctx context.Context,
+	req OrganizeRequest,
+	dryRun bool,
+) (*organizer.Organizer, error) {
 	config := req.Config.ToOrganizerConfig()
 	config.DryRun = dryRun
 	org, err := organizer.NewOrganizer(&config)
@@ -99,9 +103,17 @@ func (s *Service) executeOrganize(req OrganizeRequest, dryRun bool) (*organizer.
 		return items[i].SourcePath < items[j].SourcePath
 	})
 
+	baseDir := filepath.Clean(org.BaseDir())
 	processed := 0
+	seenSourcePaths := make(map[string]struct{}, len(items))
 	startTime := time.Now()
 	for _, item := range items {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		sourcePath := item.SourcePath
 		if sourcePath == "" {
 			continue
@@ -113,10 +125,28 @@ func (s *Service) executeOrganize(req OrganizeRequest, dryRun bool) (*organizer.
 			}
 			return nil, fmt.Errorf("resolving ABS item path %s: %w", sourcePath, err)
 		}
-		sourcePath = resolvedSourcePath
-		if !isPathWithin(org.BaseDir(), sourcePath) || !org.IsAllowedSourcePath(sourcePath) {
+		sourcePath = filepath.Clean(resolvedSourcePath)
+
+		// Never treat the library root itself as one audiobook. Compact/incomplete ABS
+		// records can occasionally resolve item.Path to the mapped library root. Passing
+		// that path to OrganizePathWithMetadata makes the organizer inspect the entire
+		// library using one book's metadata, which can make web previews appear hung and
+		// is unsafe for a real run. A valid ABS book source must be below the root.
+		if sourcePath == baseDir {
 			continue
 		}
+
+		if !isPathWithin(baseDir, sourcePath) || !org.IsAllowedSourcePath(sourcePath) {
+			continue
+		}
+
+		// ABS can expose duplicate records for the same physical source path. Process a
+		// filesystem object only once per preview/run instead of repeatedly scanning it.
+		if _, alreadyProcessed := seenSourcePaths[sourcePath]; alreadyProcessed {
+			continue
+		}
+		seenSourcePaths[sourcePath] = struct{}{}
+
 		if err := org.OrganizePathWithMetadata(sourcePath, item); err != nil {
 			if config.SkipErrors {
 				continue
