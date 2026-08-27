@@ -234,11 +234,74 @@ func (p *MetadataProvider) applyFileMetadata(
 	}
 }
 
+// sourcePathForItem returns the path that should actually be moved for an ABS item.
+//
+// ABS stores its metadata in its own database/appdata and exposes that metadata via
+// the API. The audiobook files therefore do not need metadata.json sidecars beside
+// them. For normal folder-based books item.Path is the book directory. For a flat
+// library, however, ABS can represent the item at the library root while the actual
+// audiobook path lives in media.audioFiles[].metadata.path. In that case using
+// item.Path makes every flat book appear to be the same directory and only a small
+// subset can be organized correctly.
+func (p *MetadataProvider) sourcePathForItem(item *LibraryItem) string {
+	absSourcePath := item.Path
+
+	// A file-backed ABS item should always resolve to its actual media file when ABS
+	// provides one. This is the common representation for a single M4B in a flat
+	// Audiobookshelf library.
+	if item.IsFile {
+		if filePath := preferredAudioFilePath(item); filePath != "" {
+			absSourcePath = filePath
+		}
+	}
+
+	// Some ABS versions/scanners expose a flat item with item.Path equal to the
+	// library root instead of marking IsFile. If exactly one audio file belongs to
+	// the item, that file is the unambiguous source to organize.
+	if absSourcePath == "" || p.isMappedLibraryRoot(absSourcePath) {
+		if filePath := singleAudioFilePath(item); filePath != "" {
+			absSourcePath = filePath
+		}
+	}
+
+	return p.mapper.ToLocal(absSourcePath)
+}
+
+func preferredAudioFilePath(item *LibraryItem) string {
+	for _, audioFile := range item.Media.AudioFiles {
+		if audioFile.Metadata.Path != "" {
+			return audioFile.Metadata.Path
+		}
+	}
+	for _, libraryFile := range item.LibraryFiles {
+		if libraryFile.Metadata.Path != "" {
+			return libraryFile.Metadata.Path
+		}
+	}
+	return ""
+}
+
+func singleAudioFilePath(item *LibraryItem) string {
+	if len(item.Media.AudioFiles) == 1 {
+		return item.Media.AudioFiles[0].Metadata.Path
+	}
+	return ""
+}
+
+func (p *MetadataProvider) isMappedLibraryRoot(absPath string) bool {
+	for _, mapping := range p.mapper.Mappings {
+		if sameABSPath(mapping.ABSPrefix, absPath) {
+			return true
+		}
+	}
+	return false
+}
+
 // convertToOrganizerMetadata converts ABS LibraryItem to organizer.Metadata
 func (p *MetadataProvider) convertToOrganizerMetadata(item *LibraryItem) organizer.Metadata {
 	meta := organizer.NewMetadata()
 	meta.SourceType = "abs"
-	meta.SourcePath = p.mapper.ToLocal(item.Path)
+	meta.SourcePath = p.sourcePathForItem(item)
 
 	absMedia := item.Media.Metadata
 
@@ -289,7 +352,7 @@ func (p *MetadataProvider) convertToOrganizerMetadata(item *LibraryItem) organiz
 	meta.RawData["authorNamesLastFirst"] = item.AuthorNamesLastFirst
 	meta.RawData["abs_item_id"] = item.ID
 	meta.RawData["abs_library_id"] = item.LibraryID
-	meta.RawData["abs_path"] = item.Path // Original ABS path before mapping
+	meta.RawData["abs_path"] = item.Path // Original ABS item path before source-file resolution/mapping
 	meta.RawData["abs_relpath"] = item.RelPath
 	meta.RawData["abs_duration"] = item.Media.Duration
 	meta.RawData["abs_narrator"] = absMedia.NarratorName
