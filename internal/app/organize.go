@@ -152,8 +152,15 @@ func (s *Service) executeOrganize(ctx context.Context, req OrganizeRequest, dryR
 	if processed == 0 {
 		return nil, fmt.Errorf("no mapped ABS items found under %s", org.BaseDir())
 	}
-	if err := org.Finish(startTime); err != nil {
-		return nil, err
+
+	// Do not call Organizer.Finish for a preview. Finish includes optional source
+	// cleanup intended for real runs; in dry-run mode that cleanup can repeatedly
+	// rediscover the same empty directories because they are intentionally not
+	// deleted. The preview summary is already complete at this point.
+	if !dryRun {
+		if err := org.Finish(startTime); err != nil {
+			return nil, err
+		}
 	}
 	return org, nil
 }
