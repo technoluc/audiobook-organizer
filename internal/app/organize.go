@@ -67,11 +67,7 @@ func (s *Service) RunOrganize(
 	return &OrganizeRunResponse{Summary: org.GetSummary(), LogPath: org.GetLogPath()}, nil
 }
 
-func (s *Service) executeOrganize(
-	ctx context.Context,
-	req OrganizeRequest,
-	dryRun bool,
-) (*organizer.Organizer, error) {
+func (s *Service) executeOrganize(ctx context.Context, req OrganizeRequest, dryRun bool) (*organizer.Organizer, error) {
 	config := req.Config.ToOrganizerConfig()
 	config.DryRun = dryRun
 	org, err := organizer.NewOrganizer(&config)
@@ -103,10 +99,9 @@ func (s *Service) executeOrganize(
 		return items[i].SourcePath < items[j].SourcePath
 	})
 
-	baseDir := filepath.Clean(org.BaseDir())
 	processed := 0
-	seenSourcePaths := make(map[string]struct{}, len(items))
 	startTime := time.Now()
+	seenSourcePaths := make(map[string]struct{})
 	for _, item := range items {
 		select {
 		case <-ctx.Done():
@@ -125,29 +120,28 @@ func (s *Service) executeOrganize(
 			}
 			return nil, fmt.Errorf("resolving ABS item path %s: %w", sourcePath, err)
 		}
-		sourcePath = filepath.Clean(resolvedSourcePath)
+		sourcePath = resolvedSourcePath
 
-		// Never treat the library root itself as one audiobook. Compact/incomplete ABS
-		// records can occasionally resolve item.Path to the mapped library root. Passing
-		// that path to OrganizePathWithMetadata makes the organizer inspect the entire
-		// library using one book's metadata, which can make web previews appear hung and
-		// is unsafe for a real run. A valid ABS book source must be below the root.
-		if sourcePath == baseDir {
+		// Never treat the library root itself as one audiobook. A compact ABS
+		// record can otherwise make a flat library look like a single giant item.
+		if filepath.Clean(sourcePath) == filepath.Clean(org.BaseDir()) {
 			continue
 		}
-
-		if !isPathWithin(baseDir, sourcePath) || !org.IsAllowedSourcePath(sourcePath) {
-			continue
-		}
-
-		// ABS can expose duplicate records for the same physical source path. Process a
-		// filesystem object only once per preview/run instead of repeatedly scanning it.
-		if _, alreadyProcessed := seenSourcePaths[sourcePath]; alreadyProcessed {
+		if _, seen := seenSourcePaths[sourcePath]; seen {
 			continue
 		}
 		seenSourcePaths[sourcePath] = struct{}{}
 
-		if err := org.OrganizePathWithMetadata(sourcePath, item); err != nil {
+		if !isPathWithin(org.BaseDir(), sourcePath) || !org.IsAllowedSourcePath(sourcePath) {
+			continue
+		}
+
+		if dryRun {
+			err = org.PreviewPathWithMetadata(sourcePath, item)
+		} else {
+			err = org.OrganizePathWithMetadata(sourcePath, item)
+		}
+		if err != nil {
 			if config.SkipErrors {
 				continue
 			}
