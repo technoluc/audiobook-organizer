@@ -67,13 +67,18 @@ function restoreMappings(mappings: PersistedWebState['absPathMappings']) {
   const addButton = [...document.querySelectorAll<HTMLButtonElement>('button')].find((button) =>
     buttonText(button).includes('Add Mapping'),
   )
-  let absInputs = [...document.querySelectorAll<HTMLInputElement>('input[aria-label="ABS path prefix"]')]
-  let localInputs = [...document.querySelectorAll<HTMLInputElement>('input[aria-label="Local path prefix"]')]
+  const absInputs = [...document.querySelectorAll<HTMLInputElement>('input[aria-label="ABS path prefix"]')]
+  const localInputs = [...document.querySelectorAll<HTMLInputElement>('input[aria-label="Local path prefix"]')]
 
-  while (addButton && absInputs.length < mappings.length) {
+  // Vue renders a newly added mapping asynchronously. The old implementation
+  // used a while loop that immediately queried the DOM again after click().
+  // Because the DOM had not updated yet, the input count never changed and the
+  // browser could enter an infinite loop during page restore. Add at most one
+  // row per render cycle; the MutationObserver below will continue restoration
+  // after Vue has rendered the new row.
+  if (addButton && absInputs.length < mappings.length) {
     addButton.click()
-    absInputs = [...document.querySelectorAll<HTMLInputElement>('input[aria-label="ABS path prefix"]')]
-    localInputs = [...document.querySelectorAll<HTMLInputElement>('input[aria-label="Local path prefix"]')]
+    return
   }
 
   mappings.forEach((mapping, index) => {
@@ -162,14 +167,21 @@ export function installWebStatePersistence() {
 
   // ABS library controls appear asynchronously after Test Connection. Restore
   // only the late-rendered library selection and mappings when that happens.
+  let observerScheduled = false
   const observer = new MutationObserver(() => {
-    const library = selectByLabel('ABS library')
-    if (library && persisted.absLibrary && library.value !== persisted.absLibrary) {
-      setSelectValue(library, persisted.absLibrary)
-    }
-    if (persisted.absPathMappings?.length) {
-      restoreMappings(persisted.absPathMappings)
-    }
+    if (observerScheduled) return
+    observerScheduled = true
+
+    window.requestAnimationFrame(() => {
+      observerScheduled = false
+      const library = selectByLabel('ABS library')
+      if (library && persisted.absLibrary && library.value !== persisted.absLibrary) {
+        setSelectValue(library, persisted.absLibrary)
+      }
+      if (persisted.absPathMappings?.length) {
+        restoreMappings(persisted.absPathMappings)
+      }
+    })
   })
   observer.observe(document.body, { childList: true, subtree: true })
 }
