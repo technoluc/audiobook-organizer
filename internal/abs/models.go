@@ -30,6 +30,9 @@ type LibraryItemsResponse struct {
 	Total   int           `json:"total"`
 	Limit   int           `json:"limit"`
 	Page    int           `json:"page"`
+	// Offset is kept for compatibility with older tests/callers, but current ABS
+	// library pagination is page-based and does not populate this field.
+	Offset int `json:"offset,omitempty"`
 }
 
 // LibraryItem represents an audiobook/podcast in ABS
