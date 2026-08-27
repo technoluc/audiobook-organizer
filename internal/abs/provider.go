@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"sync"
 
 	"github.com/jeeftor/audiobook-organizer/internal/organizer"
 )
@@ -64,7 +65,6 @@ func NewMetadataProviderAllLibraries(
 func NewMetadataProviderWithSQLite(
 	apiURL, apiToken, libraryID, sqlitePath, userInputPath string,
 ) (*MetadataProvider, error) {
-	// Discover path mappings from SQLite
 	mapper, err := NewPathMapperFromSQLite(sqlitePath, userInputPath)
 	if err != nil {
 		return nil, fmt.Errorf("path discovery failed: %w", err)
@@ -80,7 +80,11 @@ func NewMetadataProviderWithSQLite(
 	}, nil
 }
 
-// LoadAllItems fetches all library items from ABS (for path matching)
+// LoadAllItems fetches all library items from ABS (for path matching).
+// The library-items endpoint can return compact records that omit libraryFiles and
+// media.audioFiles. Those file paths are essential when ABS metadata lives in its
+// own appdata and the audiobook files themselves are flat or do not have sidecars.
+// Hydrate only incomplete records through /api/items/:id, with bounded concurrency.
 func (p *MetadataProvider) LoadAllItems() error {
 	if p.allLibraries {
 		return p.loadAllLibraries()
@@ -90,8 +94,58 @@ func (p *MetadataProvider) LoadAllItems() error {
 	if err != nil {
 		return fmt.Errorf("fetching library items: %w", err)
 	}
-	p.itemsCache = items
+	p.itemsCache = p.hydrateIncompleteItems(items)
 	return nil
+}
+
+func (p *MetadataProvider) hydrateIncompleteItems(items []LibraryItem) []LibraryItem {
+	const workers = 8
+
+	result := make([]LibraryItem, len(items))
+	copy(result, items)
+
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+
+	worker := func() {
+		defer wg.Done()
+		for index := range jobs {
+			item := result[index]
+			if !needsItemHydration(&item) || item.ID == "" {
+				continue
+			}
+			detail, err := p.client.GetLibraryItem(item.ID)
+			if err != nil || detail == nil {
+				// Keep the compact list record. A single stale/invalid ABS item should
+				// not make the entire preview fail.
+				continue
+			}
+			if detail.LibraryID == "" {
+				detail.LibraryID = item.LibraryID
+			}
+			result[index] = *detail
+		}
+	}
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go worker()
+	}
+	for i := range result {
+		if needsItemHydration(&result[i]) && result[i].ID != "" {
+			jobs <- i
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	return result
+}
+
+func needsItemHydration(item *LibraryItem) bool {
+	return len(item.LibraryFiles) == 0 &&
+		len(item.Media.AudioFiles) == 0 &&
+		item.Media.EbookFile == nil
 }
 
 // loadAllLibraries fetches items from ALL libraries
@@ -105,13 +159,12 @@ func (p *MetadataProvider) loadAllLibraries() error {
 	for _, lib := range libraries {
 		items, err := p.client.GetAllLibraryItems(lib.ID)
 		if err != nil {
-			// Log warning but continue with other libraries
 			continue
 		}
-		// Tag each item with its library info for later
 		for i := range items {
 			items[i].LibraryID = lib.ID
 		}
+		items = p.hydrateIncompleteItems(items)
 		allItems = append(allItems, items...)
 	}
 
@@ -121,7 +174,6 @@ func (p *MetadataProvider) loadAllLibraries() error {
 
 // FindItemByPath finds an ABS item matching a local ABS item directory or file.
 // Exact file records take precedence over a containing item directory.
-// Works across all libraries if allLibraries mode is enabled.
 func (p *MetadataProvider) FindItemByPath(localPath string) (*LibraryItem, error) {
 	if p.itemsCache == nil {
 		if err := p.LoadAllItems(); err != nil {
@@ -129,7 +181,6 @@ func (p *MetadataProvider) FindItemByPath(localPath string) (*LibraryItem, error
 		}
 	}
 
-	// Convert local path to ABS path
 	absPath := p.mapper.ToABS(localPath)
 
 	for i := range p.itemsCache {
@@ -205,9 +256,7 @@ func (p *MetadataProvider) FindItemsByLibrary() map[string][]LibraryItem {
 }
 
 // GetMetadata returns metadata for a local audiobook path
-// This implements the organizer.MetadataProvider interface
 func (p *MetadataProvider) GetMetadata(localPath string) (organizer.Metadata, error) {
-	// Find the ABS item for this path
 	item, err := p.FindItemByPath(localPath)
 	if err != nil {
 		return organizer.NewMetadata(), err
@@ -235,29 +284,15 @@ func (p *MetadataProvider) applyFileMetadata(
 }
 
 // sourcePathForItem returns the path that should actually be moved for an ABS item.
-//
-// ABS stores its metadata in its own database/appdata and exposes that metadata via
-// the API. The audiobook files therefore do not need metadata.json sidecars beside
-// them. For normal folder-based books item.Path is the book directory. For a flat
-// library, however, ABS can represent the item at the library root while the actual
-// audiobook path lives in media.audioFiles[].metadata.path. In that case using
-// item.Path makes every flat book appear to be the same directory and only a small
-// subset can be organized correctly.
 func (p *MetadataProvider) sourcePathForItem(item *LibraryItem) string {
 	absSourcePath := item.Path
 
-	// A file-backed ABS item should always resolve to its actual media file when ABS
-	// provides one. This is the common representation for a single M4B in a flat
-	// Audiobookshelf library.
 	if item.IsFile {
 		if filePath := preferredAudioFilePath(item); filePath != "" {
 			absSourcePath = filePath
 		}
 	}
 
-	// Some ABS versions/scanners expose a flat item with item.Path equal to the
-	// library root instead of marking IsFile. If exactly one audio file belongs to
-	// the item, that file is the unambiguous source to organize.
 	if absSourcePath == "" || p.isMappedLibraryRoot(absSourcePath) {
 		if filePath := singleAudioFilePath(item); filePath != "" {
 			absSourcePath = filePath
@@ -304,17 +339,13 @@ func (p *MetadataProvider) convertToOrganizerMetadata(item *LibraryItem) organiz
 	meta.SourcePath = p.sourcePathForItem(item)
 
 	absMedia := item.Media.Metadata
-
-	// Title
 	meta.Title = absMedia.Title
 
-	// Authors - handle both array format and flattened string format
 	for _, author := range absMedia.Authors {
 		if author.Name != "" {
 			meta.Authors = append(meta.Authors, author.Name)
 		}
 	}
-	// Also check flattened authorName if array is empty
 	if len(meta.Authors) == 0 && absMedia.AuthorName != "" {
 		meta.Authors = append(meta.Authors, absMedia.AuthorName)
 	}
@@ -325,7 +356,6 @@ func (p *MetadataProvider) convertToOrganizerMetadata(item *LibraryItem) organiz
 		meta.Authors = append(meta.Authors, splitABSNames(item.AuthorNamesLastFirst)...)
 	}
 
-	// Series
 	for _, series := range absMedia.Series {
 		if series.Name != "" {
 			meta.Series = append(meta.Series, series.Name)
@@ -335,7 +365,6 @@ func (p *MetadataProvider) convertToOrganizerMetadata(item *LibraryItem) organiz
 		meta.Series = append(meta.Series, absMedia.SeriesName)
 	}
 
-	// Store ABS-specific data in RawData for advanced use
 	meta.RawData["title"] = meta.Title
 	meta.RawData["authors"] = strings.Join(meta.Authors, ", ")
 	meta.RawData["series"] = strings.Join(meta.Series, ", ")
@@ -352,7 +381,7 @@ func (p *MetadataProvider) convertToOrganizerMetadata(item *LibraryItem) organiz
 	meta.RawData["authorNamesLastFirst"] = item.AuthorNamesLastFirst
 	meta.RawData["abs_item_id"] = item.ID
 	meta.RawData["abs_library_id"] = item.LibraryID
-	meta.RawData["abs_path"] = item.Path // Original ABS item path before source-file resolution/mapping
+	meta.RawData["abs_path"] = item.Path
 	meta.RawData["abs_relpath"] = item.RelPath
 	meta.RawData["abs_duration"] = item.Media.Duration
 	meta.RawData["abs_narrator"] = absMedia.NarratorName
@@ -392,22 +421,18 @@ func splitABSNames(value string) []string {
 	return names
 }
 
-// ScanLibrary triggers an ABS library scan
 func (p *MetadataProvider) ScanLibrary() error {
 	return p.client.ScanLibrary(p.libraryID)
 }
 
-// GetPathMappings returns the current path mappings (for display/debugging)
 func (p *MetadataProvider) GetPathMappings() []PathMapping {
 	return p.mapper.Mappings
 }
 
-// Mapper returns the path mapper (for path conversion)
 func (p *MetadataProvider) Mapper() *PathMapper {
 	return p.mapper
 }
 
-// Client returns the underlying ABS API client (for advanced use)
 func (p *MetadataProvider) Client() *Client {
 	return p.client
 }
