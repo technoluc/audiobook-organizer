@@ -385,6 +385,17 @@ func (p *UnifiedMetadataProvider) extractAudioMetadata() (Metadata, error) {
 	// Check for additional fields in raw tags first (to support all variations)
 	rawTags := m.Raw()
 
+	// MP4/M4B files store audiobook series metadata in iTunes freeform atoms.
+	// Prefer those explicit values over the album fallback and keep the series
+	// position separate from the audio track number.
+	if series, seriesIndex := getSeriesFromRawTags(rawTags); series != "" {
+		metadata.Series = []string{series}
+		metadata.RawData["series"] = series
+		if seriesIndex > 0 {
+			metadata.RawData["series_index"] = seriesIndex
+		}
+	}
+
 	// Get track numbers - check all variations (case-insensitive)
 	// Audiobookshelf spec: track, trck, trk
 	trackNum := 0
@@ -499,6 +510,31 @@ func (p *UnifiedMetadataProvider) extractAudioMetadata() (Metadata, error) {
 	}
 
 	return metadata, nil
+}
+
+func getSeriesFromRawTags(rawTags map[string]interface{}) (string, float64) {
+	var series string
+	var seriesIndex float64
+	for key, value := range rawTags {
+		text, ok := value.(string)
+		if !ok {
+			continue
+		}
+		// dhowden/tag can retain the four-byte MP4 freeform locale prefix.
+		text = strings.Trim(text, "\x00 \t\r\n")
+		if text == "" {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "series":
+			series = text
+		case "series-part", "series_part", "series_index":
+			if parsed, err := strconv.ParseFloat(text, 64); err == nil && parsed > 0 {
+				seriesIndex = parsed
+			}
+		}
+	}
+	return series, seriesIndex
 }
 
 // ExtractCalibreSeriesFromOPF extracts series information from Calibre metadata in EPUB
