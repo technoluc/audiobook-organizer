@@ -42,7 +42,7 @@ func (s *Service) PreviewOrganize(
 	default:
 	}
 
-	org, err := s.executeOrganize(req, true)
+	org, err := s.executeOrganize(ctx, req, true)
 	if err != nil {
 		return nil, err
 	}
@@ -60,14 +60,14 @@ func (s *Service) RunOrganize(
 	default:
 	}
 
-	org, err := s.executeOrganize(req, false)
+	org, err := s.executeOrganize(ctx, req, false)
 	if err != nil {
 		return nil, err
 	}
 	return &OrganizeRunResponse{Summary: org.GetSummary(), LogPath: org.GetLogPath()}, nil
 }
 
-func (s *Service) executeOrganize(req OrganizeRequest, dryRun bool) (*organizer.Organizer, error) {
+func (s *Service) executeOrganize(ctx context.Context, req OrganizeRequest, dryRun bool) (*organizer.Organizer, error) {
 	config := req.Config.ToOrganizerConfig()
 	config.DryRun = dryRun
 	org, err := organizer.NewOrganizer(&config)
@@ -101,7 +101,14 @@ func (s *Service) executeOrganize(req OrganizeRequest, dryRun bool) (*organizer.
 
 	processed := 0
 	startTime := time.Now()
+	seenSourcePaths := make(map[string]struct{})
 	for _, item := range items {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		sourcePath := item.SourcePath
 		if sourcePath == "" {
 			continue
@@ -114,10 +121,27 @@ func (s *Service) executeOrganize(req OrganizeRequest, dryRun bool) (*organizer.
 			return nil, fmt.Errorf("resolving ABS item path %s: %w", sourcePath, err)
 		}
 		sourcePath = resolvedSourcePath
+
+		// Never treat the library root itself as one audiobook. A compact ABS
+		// record can otherwise make a flat library look like a single giant item.
+		if filepath.Clean(sourcePath) == filepath.Clean(org.BaseDir()) {
+			continue
+		}
+		if _, seen := seenSourcePaths[sourcePath]; seen {
+			continue
+		}
+		seenSourcePaths[sourcePath] = struct{}{}
+
 		if !isPathWithin(org.BaseDir(), sourcePath) || !org.IsAllowedSourcePath(sourcePath) {
 			continue
 		}
-		if err := org.OrganizePathWithMetadata(sourcePath, item); err != nil {
+
+		if dryRun {
+			err = org.PreviewPathWithMetadata(sourcePath, item)
+		} else {
+			err = org.OrganizePathWithMetadata(sourcePath, item)
+		}
+		if err != nil {
 			if config.SkipErrors {
 				continue
 			}
@@ -128,8 +152,15 @@ func (s *Service) executeOrganize(req OrganizeRequest, dryRun bool) (*organizer.
 	if processed == 0 {
 		return nil, fmt.Errorf("no mapped ABS items found under %s", org.BaseDir())
 	}
-	if err := org.Finish(startTime); err != nil {
-		return nil, err
+
+	// Do not call Organizer.Finish for a preview. Finish includes optional source
+	// cleanup intended for real runs; in dry-run mode that cleanup can repeatedly
+	// rediscover the same empty directories because they are intentionally not
+	// deleted. The preview summary is already complete at this point.
+	if !dryRun {
+		if err := org.Finish(startTime); err != nil {
+			return nil, err
+		}
 	}
 	return org, nil
 }

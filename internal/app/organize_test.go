@@ -99,11 +99,21 @@ func TestRunOrganizeWithABSMetadataHonorsAllowedSourcePaths(t *testing.T) {
 	writeFile(t, filepath.Join(selectedDir, "selected.m4b"), "selected audio")
 	writeFile(t, filepath.Join(unselectedDir, "unselected.m4b"), "unselected audio")
 
+
 	absServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer test-token" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+	
+		// Alleen het overzicht van ABS-boeken ondersteunen.
+		// Andere endpoints krijgen 404, zodat de organizer
+		// de oorspronkelijke metadata uit het overzicht behoudt.
+		if r.URL.Path != "/api/libraries/lib-main/items" {
+			http.NotFound(w, r)
+			return
+		}
+	
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"results": []map[string]any{
 				absOrganizeTestItem("selected", "Selected ABS Book", "Selected ABS Author"),

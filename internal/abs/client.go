@@ -141,13 +141,13 @@ func (c *Client) GetLibraries() ([]Library, error) {
 	return result.Libraries, nil
 }
 
-// GetLibraryItems returns items from a library with pagination
+// GetLibraryItems returns one zero-based page of items from an ABS library.
 func (c *Client) GetLibraryItems(
 	libraryID string,
-	limit, offset int,
+	limit, page int,
 ) (*LibraryItemsResponse, error) {
-	path := fmt.Sprintf("/api/libraries/%s/items?limit=%d&offset=%d", libraryID, limit, offset)
-	resp, err := c.request("GET", path, nil)
+	requestPath := fmt.Sprintf("/api/libraries/%s/items?limit=%d&page=%d", libraryID, limit, page)
+	resp, err := c.request("GET", requestPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -161,24 +161,26 @@ func (c *Client) GetLibraryItems(
 	return &result, nil
 }
 
-// GetAllLibraryItems returns all items from a library (handles pagination)
+// GetAllLibraryItems returns all items from a library (handles ABS page-based pagination).
 func (c *Client) GetAllLibraryItems(libraryID string) ([]LibraryItem, error) {
 	const limit = 100
 	var allItems []LibraryItem
-	offset := 0
+	page := 0
 
 	for {
-		resp, err := c.GetLibraryItems(libraryID, limit, offset)
+		resp, err := c.GetLibraryItems(libraryID, limit, page)
 		if err != nil {
 			return nil, err
 		}
 
 		allItems = append(allItems, resp.Results...)
 
-		if offset+len(resp.Results) >= resp.Total {
+		// ABS uses zero-based pages. Stop when we have collected the reported total,
+		// or when a short/empty page proves there is nothing left to fetch.
+		if len(allItems) >= resp.Total || len(resp.Results) == 0 || len(resp.Results) < limit {
 			break
 		}
-		offset += limit
+		page++
 	}
 
 	return allItems, nil
